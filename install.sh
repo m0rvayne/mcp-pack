@@ -75,6 +75,15 @@ add_to_path() {
     printf '\n# Added by MCP Pack installer\nexport PATH="%s:$PATH"\n' "$dir" >> "$profile"
 }
 
+# ─── Check if git actually works (not just Xcode CLT shim) ───────────────────
+
+git_works() {
+    command -v git >/dev/null 2>&1 || return 1
+    # On fresh Mac, /usr/bin/git is a shim that triggers Xcode CLT dialog
+    # Test if git actually works without triggering the dialog
+    git --version >/dev/null 2>&1
+}
+
 # ─── Check macOS ──────────────────────────────────────────────────────────────
 
 if [ "$(uname)" != "Darwin" ]; then
@@ -88,7 +97,9 @@ info "macOS $(sw_vers -productVersion) ($ARCH)"
 # ─── Check Claude Desktop ────────────────────────────────────────────────────
 
 if [ ! -d "$CLAUDE_CONFIG_DIR" ]; then
-    if mdfind "kMDItemCFBundleIdentifier == 'com.anthropic.claude'" 2>/dev/null | grep -q .; then
+    # Check both Spotlight and common paths
+    if mdfind "kMDItemCFBundleIdentifier == 'com.anthropic.claude'" 2>/dev/null | grep -q . \
+       || [ -d "/Applications/Claude.app" ]; then
         mkdir -p "$CLAUDE_CONFIG_DIR"
     else
         err "Claude Desktop not found. Install it from https://claude.ai/download"
@@ -168,37 +179,11 @@ else
     info "Python 3.12 already available"
 fi
 
-# ─── Install Claude CLI ──────────────────────────────────────────────────────
-
-say "Installing Claude CLI..."
-if command -v claude >/dev/null 2>&1; then
-    info "Claude CLI already installed"
-else
-    # Always use script's npm (or system npm if it points to user-writable location)
-    if [ "$USED_SCRIPT_NODE" = true ]; then
-        "$NPM_BIN" install -g @anthropic-ai/claude-code \
-            || err "Failed to install Claude CLI"
-    else
-        # Try global install, fall back to local
-        "$NPM_BIN" install -g @anthropic-ai/claude-code 2>/dev/null || {
-            warn "Global npm install failed (may need sudo). Installing locally..."
-            mkdir -p "$INSTALL_DIR/.claude-cli"
-            cd "$INSTALL_DIR/.claude-cli"
-            "$NPM_BIN" init -y >/dev/null 2>&1
-            "$NPM_BIN" install @anthropic-ai/claude-code \
-                || err "Failed to install Claude CLI"
-            export PATH="$INSTALL_DIR/.claude-cli/node_modules/.bin:$PATH"
-            add_to_path "$INSTALL_DIR/.claude-cli/node_modules/.bin"
-        }
-    fi
-    info "Claude CLI installed"
-fi
-
-# ─── Download connectors ─────────────────────────────────────────────────────
+# ─── Download connectors (BEFORE Claude CLI to avoid $INSTALL_DIR conflict) ──
 
 say "Downloading MCP connectors..."
 
-if command -v git >/dev/null 2>&1; then
+if git_works; then
     if [ -d "$INSTALL_DIR/.git" ]; then
         info "Updating existing installation..."
         git -C "$INSTALL_DIR" pull --ff-only 2>/dev/null || true
@@ -214,26 +199,21 @@ if command -v git >/dev/null 2>&1; then
             || err "Failed to download connectors. Check your internet connection."
         # Restore user data
         if [ -d "$TMPDIR_INSTALL/connectors_backup" ]; then
-            for d in "$TMPDIR_INSTALL/connectors_backup"/*/; do
-                local dirname=$(basename "$d")
-                # Restore only user-created files (tokens, credentials)
-                find "$d" -name "token.json" -o -name "credentials.json" -o -name ".env" 2>/dev/null | while read f; do
-                    local rel="${f#$TMPDIR_INSTALL/connectors_backup/}"
-                    local dest="$INSTALL_DIR/connectors/$rel"
-                    mkdir -p "$(dirname "$dest")"
-                    cp "$f" "$dest"
-                done
+            find "$TMPDIR_INSTALL/connectors_backup" \( -name "token.json" -o -name "credentials.json" -o -name ".env" \) 2>/dev/null | while read -r f; do
+                local rel="${f#$TMPDIR_INSTALL/connectors_backup/}"
+                local dest="$INSTALL_DIR/connectors/$rel"
+                mkdir -p "$(dirname "$dest")"
+                cp "$f" "$dest"
             done
         fi
     fi
 else
-    info "git not found, downloading archive..."
+    info "git not available, downloading archive..."
     local tarball="$TMPDIR_INSTALL/mcp-pack.tar.gz"
     curl -fsSL -o "$tarball" "$REPO/archive/refs/heads/main.tar.gz" \
         || err "Failed to download connectors. Check your internet connection."
 
     if [ -d "$INSTALL_DIR" ]; then
-        # Preserve user data
         if [ -d "$INSTALL_DIR/connectors" ]; then
             mv "$INSTALL_DIR/connectors" "$TMPDIR_INSTALL/connectors_backup" 2>/dev/null || true
         fi
@@ -246,6 +226,33 @@ else
 fi
 
 info "Connectors at $INSTALL_DIR"
+
+# ─── Install Claude CLI (AFTER connectors so $INSTALL_DIR exists) ─────────────
+
+say "Installing Claude CLI..."
+if command -v claude >/dev/null 2>&1; then
+    info "Claude CLI already installed"
+else
+    if [ "$USED_SCRIPT_NODE" = true ]; then
+        # Script-installed Node: global prefix is ~/.nodejs (user-writable)
+        "$NPM_BIN" install -g @anthropic-ai/claude-code \
+            || err "Failed to install Claude CLI"
+    else
+        # System Node: try global, fall back to local in a SAFE location
+        "$NPM_BIN" install -g @anthropic-ai/claude-code 2>/dev/null || {
+            warn "Global npm install failed (may need sudo). Installing locally..."
+            local cli_dir="$HOME/.claude-cli"
+            mkdir -p "$cli_dir"
+            cd "$cli_dir"
+            "$NPM_BIN" init -y >/dev/null 2>&1
+            "$NPM_BIN" install @anthropic-ai/claude-code \
+                || err "Failed to install Claude CLI"
+            export PATH="$cli_dir/node_modules/.bin:$PATH"
+            add_to_path "$cli_dir/node_modules/.bin"
+        }
+    fi
+    info "Claude CLI installed"
+fi
 
 # ─── Install dependencies ────────────────────────────────────────────────────
 
@@ -339,7 +346,13 @@ try:
 except (json.JSONDecodeError, FileNotFoundError):
     config = {'mcpServers': {}}
 
-existing = config.setdefault('mcpServers', {})
+# Ensure config is a dict with mcpServers
+if not isinstance(config, dict):
+    config = {'mcpServers': {}}
+if 'mcpServers' not in config or not isinstance(config.get('mcpServers'), dict):
+    config['mcpServers'] = {}
+
+existing = config['mcpServers']
 added = 0
 for key, val in new_servers.items():
     if key not in existing:
