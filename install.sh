@@ -387,8 +387,8 @@ SERVERS_JSON=$(cat <<JSONEOF
             }
         },
         "fathom": {
-            "command": "$UV_BIN",
-            "args": ["--directory", "$INSTALL_DIR/connectors/MCP_Fathom", "run", "fastmcp", "run", "server.py"],
+            "command": "$INSTALL_DIR/connectors/MCP_Fathom/.venv/bin/python3",
+            "args": ["$INSTALL_DIR/connectors/MCP_Fathom/server.py"],
             "env": {
                 "FATHOM_API_KEY": "CONFIGURE_ME",
                 "FATHOM_WEBHOOK_SECRET": "CONFIGURE_ME"
