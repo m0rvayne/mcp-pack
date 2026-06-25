@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "fathom": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/fathom-mcp",
+        "run",
+        "fastmcp",
+        "run",
+        "server.py"
+      ],
+      "env": {
+        "FATHOM_API_KEY": "your_api_key_here"
+      }
+    }
+  }
+}

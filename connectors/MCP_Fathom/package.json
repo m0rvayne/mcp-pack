@@ -1,0 +1,35 @@
+{
+  "name": "fathom-mcp-server",
+  "version": "1.0.0",
+  "description": "A Model Context Protocol server for Fathom AI - access meeting recordings, transcripts, summaries, teams, and webhooks",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "fathom",
+    "fathom-ai",
+    "meetings",
+    "transcripts",
+    "fastmcp",
+    "ai",
+    "claude"
+  ],
+  "author": "Alvin Cheung",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dot-fun/fathom-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dot-fun/fathom-mcp/issues"
+  },
+  "homepage": "https://github.com/dot-fun/fathom-mcp#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "mcp": {
+    "version": "1.0",
+    "type": "server",
+    "language": "python",
+    "framework": "fastmcp"
+  }
+}

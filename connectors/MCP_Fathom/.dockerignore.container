@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Environment files
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documentation (we keep README.md)
+USAGE.md
+PROJECT_SUMMARY.md
+claude_desktop_config.json
+
+# Git
+.git/
+.gitignore
+
+# Mac
+.DS_Store
+
+# Logs
+*.log

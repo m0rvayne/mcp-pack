@@ -1,0 +1,11 @@
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+token.json
+credentials.json
+cookies.txt
+.DS_Store
+*.tgz
