@@ -11,14 +11,15 @@ CLAUDE_CONFIG_DIR="$HOME/Library/Application Support/Claude"
 CLAUDE_CONFIG="$CLAUDE_CONFIG_DIR/claude_desktop_config.json"
 NODE_VERSION="20.18.3"
 NODE_DIR="$HOME/.nodejs"
+USED_SCRIPT_NODE=false
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
 if [ -t 1 ]; then
     GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'
-    BLUE='\033[1;34m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+    BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
 else
-    GREEN=''; RED=''; YELLOW=''; BLUE=''; BOLD=''; DIM=''; RESET=''
+    GREEN=''; RED=''; YELLOW=''; BOLD=''; DIM=''; RESET=''
 fi
 
 say()  { printf "${GREEN}==>${RESET}${BOLD} %s${RESET}\n" "$1"; }
@@ -52,6 +53,28 @@ detect_arch() {
     echo "$arch"
 }
 
+# ─── Shell profile detection ─────────────────────────────────────────────────
+
+detect_profile() {
+    case "${SHELL:-}" in
+        */zsh)  echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        */bash) echo "$HOME/.bash_profile" ;;
+        *)      echo "$HOME/.profile" ;;
+    esac
+}
+
+add_to_path() {
+    local dir="$1"
+    local profile
+    profile="$(detect_profile)"
+
+    if [ -f "$profile" ] && grep -qF "$dir" "$profile" 2>/dev/null; then
+        return 0
+    fi
+
+    printf '\n# Added by MCP Pack installer\nexport PATH="%s:$PATH"\n' "$dir" >> "$profile"
+}
+
 # ─── Check macOS ──────────────────────────────────────────────────────────────
 
 if [ "$(uname)" != "Darwin" ]; then
@@ -71,7 +94,6 @@ if [ ! -d "$CLAUDE_CONFIG_DIR" ]; then
         err "Claude Desktop not found. Install it from https://claude.ai/download"
     fi
 fi
-
 info "Claude Desktop detected"
 
 # ─── Install Node.js (if needed) ─────────────────────────────────────────────
@@ -85,9 +107,17 @@ install_node() {
     fi
 
     say "Installing Node.js $NODE_VERSION..."
+    local tarball="$TMPDIR_INSTALL/node.tar.gz"
+    curl -fsSL -o "$tarball" \
+        "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-${node_arch}.tar.gz" \
+        || err "Failed to download Node.js. Check your internet connection."
+
+    rm -rf "$NODE_DIR"
     mkdir -p "$NODE_DIR"
-    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-${node_arch}.tar.gz" \
-        | tar xz -C "$NODE_DIR" --strip-components=1
+    tar xzf "$tarball" -C "$NODE_DIR" --strip-components=1 \
+        || err "Failed to extract Node.js."
+
+    USED_SCRIPT_NODE=true
     info "Installed to $NODE_DIR"
 }
 
@@ -111,13 +141,18 @@ else
     NPM_BIN="$NODE_DIR/bin/npm"
 fi
 
-export PATH="$NODE_DIR/bin:$PATH"
+# Only add to PATH if we installed Node ourselves
+if [ "$USED_SCRIPT_NODE" = true ]; then
+    export PATH="$NODE_DIR/bin:$PATH"
+    add_to_path "$NODE_DIR/bin"
+fi
 
 # ─── Install uv + Python (if needed) ─────────────────────────────────────────
 
 if ! command -v uv >/dev/null 2>&1; then
     say "Installing uv (Python package manager)..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh 2>/dev/null
+    curl -LsSf https://astral.sh/uv/install.sh | sh \
+        || err "Failed to install uv. Check your internet connection."
     export PATH="$HOME/.local/bin:$PATH"
     info "uv installed"
 else
@@ -126,7 +161,8 @@ fi
 
 if ! uv python find 3.12 >/dev/null 2>&1; then
     say "Installing Python 3.12 via uv..."
-    uv python install 3.12 2>/dev/null
+    uv python install 3.12 \
+        || err "Failed to install Python 3.12."
     info "Python 3.12 installed"
 else
     info "Python 3.12 already available"
@@ -136,11 +172,25 @@ fi
 
 say "Installing Claude CLI..."
 if command -v claude >/dev/null 2>&1; then
-    info "Claude CLI already installed ($(claude --version 2>/dev/null || echo 'unknown version'))"
+    info "Claude CLI already installed"
 else
-    "$NPM_BIN" install -g @anthropic-ai/claude-code 2>/dev/null || \
-        npm install -g @anthropic-ai/claude-code 2>/dev/null || \
-        { warn "Could not install globally, using npx"; }
+    # Always use script's npm (or system npm if it points to user-writable location)
+    if [ "$USED_SCRIPT_NODE" = true ]; then
+        "$NPM_BIN" install -g @anthropic-ai/claude-code \
+            || err "Failed to install Claude CLI"
+    else
+        # Try global install, fall back to local
+        "$NPM_BIN" install -g @anthropic-ai/claude-code 2>/dev/null || {
+            warn "Global npm install failed (may need sudo). Installing locally..."
+            mkdir -p "$INSTALL_DIR/.claude-cli"
+            cd "$INSTALL_DIR/.claude-cli"
+            "$NPM_BIN" init -y >/dev/null 2>&1
+            "$NPM_BIN" install @anthropic-ai/claude-code \
+                || err "Failed to install Claude CLI"
+            export PATH="$INSTALL_DIR/.claude-cli/node_modules/.bin:$PATH"
+            add_to_path "$INSTALL_DIR/.claude-cli/node_modules/.bin"
+        }
+    fi
     info "Claude CLI installed"
 fi
 
@@ -153,18 +203,49 @@ if command -v git >/dev/null 2>&1; then
         info "Updating existing installation..."
         git -C "$INSTALL_DIR" pull --ff-only 2>/dev/null || true
     else
-        rm -rf "$INSTALL_DIR"
-        git clone --depth 1 "$REPO.git" "$INSTALL_DIR" 2>/dev/null
+        if [ -d "$INSTALL_DIR" ]; then
+            # Preserve user data (OAuth tokens etc)
+            if [ -d "$INSTALL_DIR/connectors" ]; then
+                mv "$INSTALL_DIR/connectors" "$TMPDIR_INSTALL/connectors_backup" 2>/dev/null || true
+            fi
+            rm -rf "$INSTALL_DIR"
+        fi
+        git clone --depth 1 "$REPO.git" "$INSTALL_DIR" \
+            || err "Failed to download connectors. Check your internet connection."
+        # Restore user data
+        if [ -d "$TMPDIR_INSTALL/connectors_backup" ]; then
+            for d in "$TMPDIR_INSTALL/connectors_backup"/*/; do
+                local dirname=$(basename "$d")
+                # Restore only user-created files (tokens, credentials)
+                find "$d" -name "token.json" -o -name "credentials.json" -o -name ".env" 2>/dev/null | while read f; do
+                    local rel="${f#$TMPDIR_INSTALL/connectors_backup/}"
+                    local dest="$INSTALL_DIR/connectors/$rel"
+                    mkdir -p "$(dirname "$dest")"
+                    cp "$f" "$dest"
+                done
+            done
+        fi
     fi
 else
     info "git not found, downloading archive..."
-    curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" \
-        | tar xz -C "$(dirname "$INSTALL_DIR")"
-    rm -rf "$INSTALL_DIR"
+    local tarball="$TMPDIR_INSTALL/mcp-pack.tar.gz"
+    curl -fsSL -o "$tarball" "$REPO/archive/refs/heads/main.tar.gz" \
+        || err "Failed to download connectors. Check your internet connection."
+
+    if [ -d "$INSTALL_DIR" ]; then
+        # Preserve user data
+        if [ -d "$INSTALL_DIR/connectors" ]; then
+            mv "$INSTALL_DIR/connectors" "$TMPDIR_INSTALL/connectors_backup" 2>/dev/null || true
+        fi
+        rm -rf "$INSTALL_DIR"
+    fi
+
+    tar xzf "$tarball" -C "$(dirname "$INSTALL_DIR")" \
+        || err "Failed to extract connectors."
     mv "$(dirname "$INSTALL_DIR")/mcp-pack-main" "$INSTALL_DIR"
 fi
 
-info "Connectors downloaded to $INSTALL_DIR"
+info "Connectors at $INSTALL_DIR"
 
 # ─── Install dependencies ────────────────────────────────────────────────────
 
@@ -173,39 +254,38 @@ say "Installing connector dependencies..."
 # Trello (Python)
 info "Trello..."
 cd "$INSTALL_DIR/connectors/MCP_Trello"
-uv venv --python 3.12 .venv 2>/dev/null
-uv pip install -r requirements.txt --quiet 2>/dev/null
+uv venv --python 3.12 .venv 2>&1 | tail -1 || err "Failed to create Trello venv"
+uv pip install -r requirements.txt -p .venv 2>&1 | tail -1 || warn "Trello dependencies may be incomplete"
 
 # Fathom (Python)
 info "Fathom..."
 cd "$INSTALL_DIR/connectors/MCP_Fathom"
-uv venv --python 3.12 .venv 2>/dev/null
-uv pip install -r requirements.txt --quiet 2>/dev/null
+uv venv --python 3.12 .venv 2>&1 | tail -1 || err "Failed to create Fathom venv"
+uv pip install -r requirements.txt -p .venv 2>&1 | tail -1 || warn "Fathom dependencies may be incomplete"
 
 # Google Workspace (Python)
 info "Google Workspace..."
 cd "$INSTALL_DIR/connectors/MCP_Google_Workspace"
-uv venv --python 3.12 .venv 2>/dev/null
+uv venv --python 3.12 .venv 2>&1 | tail -1 || err "Failed to create Google Workspace venv"
 if [ -f requirements.txt ]; then
-    uv pip install -r requirements.txt --quiet 2>/dev/null
+    uv pip install -r requirements.txt -p .venv 2>&1 | tail -1 || warn "Google Workspace dependencies may be incomplete"
 fi
 
 # Telegram (Node.js)
 info "Telegram..."
 cd "$INSTALL_DIR/connectors/MCP_Telegram"
-"$NPM_BIN" install --silent 2>/dev/null || "$NPM_BIN" install 2>/dev/null
+"$NPM_BIN" install 2>&1 | tail -3 || warn "Telegram dependencies may be incomplete"
 
 # ─── Configure Claude Desktop (with placeholders) ────────────────────────────
 
 say "Configuring Claude Desktop..."
 
-# Backup existing config
 if [ -f "$CLAUDE_CONFIG" ]; then
     cp "$CLAUDE_CONFIG" "$CLAUDE_CONFIG.backup.$(date +%Y%m%d_%H%M%S)"
     info "Backed up existing config"
 fi
 
-UV_BIN="$HOME/.local/bin/uv"
+UV_BIN="$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv")"
 
 SERVERS_JSON=$(cat <<JSONEOF
 {
@@ -240,12 +320,14 @@ SERVERS_JSON=$(cat <<JSONEOF
 JSONEOF
 )
 
-# Merge into Claude Desktop config
 if [ ! -s "$CLAUDE_CONFIG" ]; then
     echo '{"mcpServers":{}}' > "$CLAUDE_CONFIG"
 fi
 
-/usr/bin/python3 -c "
+# Use uv's Python (not /usr/bin/python3 which may trigger Xcode CLT dialog)
+UV_PYTHON="$(uv python find 3.12 2>/dev/null || echo "/usr/bin/python3")"
+
+"$UV_PYTHON" -c "
 import json, sys
 
 config_path = sys.argv[1]
@@ -263,62 +345,12 @@ for key, val in new_servers.items():
     if key not in existing:
         existing[key] = val
         added += 1
-    else:
-        print(f'  skip: \"{key}\" already configured', file=sys.stderr)
 
 with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
 
-print(f'  Added {added} connector(s) to Claude Desktop config')
-" "$CLAUDE_CONFIG" "$SERVERS_JSON"
-
-# ─── Create helper script for Claude CLI to configure keys ────────────────────
-
-HELPER_SCRIPT="$INSTALL_DIR/configure-keys.sh"
-cat > "$HELPER_SCRIPT" << 'HELPEREOF'
-#!/bin/bash
-# Helper: configure API keys in Claude Desktop config
-# Usage: called by Claude CLI when user provides keys
-
-CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-
-if [ $# -lt 2 ]; then
-    echo "Usage: $0 <connector> <key>=<value> [<key>=<value> ...]"
-    echo "Connectors: trello, fathom, telegram"
-    exit 1
-fi
-
-CONNECTOR="$1"
-shift
-
-/usr/bin/python3 -c "
-import json, sys
-
-config_path = '$CONFIG'
-connector = sys.argv[1]
-pairs = sys.argv[2:]
-
-with open(config_path, 'r') as f:
-    config = json.load(f)
-
-server = config.get('mcpServers', {}).get(connector)
-if not server:
-    print(f'Connector \"{connector}\" not found in config')
-    sys.exit(1)
-
-env = server.setdefault('env', {})
-for pair in pairs:
-    key, _, value = pair.partition('=')
-    env[key] = value
-    print(f'  Set {key} for {connector}')
-
-with open(config_path, 'w') as f:
-    json.dump(config, f, indent=2)
-
-print(f'Keys configured for {connector}. Restart Claude Desktop.')
-" "$CONNECTOR" "$@"
-HELPEREOF
-chmod +x "$HELPER_SCRIPT"
+print(f'  Added {added} connector(s)')
+" "$CLAUDE_CONFIG" "$SERVERS_JSON" || err "Failed to update Claude Desktop config"
 
 # ─── Create CLAUDE.md for Claude CLI context ──────────────────────────────────
 
@@ -369,53 +401,38 @@ You should:
 3. Set mcpServers.trello.env.TRELLO_API_TOKEN = "xyz789"
 4. Save the file
 5. Tell user: "Keys configured! Restart Claude Desktop."
-
-## Helper script
-
-You can also use the helper:
-```bash
-~/.mcp-pack/configure-keys.sh trello TRELLO_API_KEY=abc123 TRELLO_API_TOKEN=xyz789
-~/.mcp-pack/configure-keys.sh fathom FATHOM_API_KEY=xxx FATHOM_WEBHOOK_SECRET=yyy
-~/.mcp-pack/configure-keys.sh telegram TELEGRAM_BOT_TOKEN=zzz
-```
 CLAUDEMD
 
 # ─── Done ─────────────────────────────────────────────────────────────────────
 
 printf "\n"
 printf "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
-printf "${GREEN}${BOLD}  ✓ MCP Pack installed successfully!${RESET}\n"
+printf "${GREEN}${BOLD}  ✓ MCP Pack installed!${RESET}\n"
 printf "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
 printf "\n"
-printf "  ${BOLD}Installed:${RESET}\n"
+printf "  ${BOLD}566 tools installed:${RESET}\n"
 printf "    • Trello           — 171 tools\n"
-printf "    • Google Workspace — 167 tools (Calendar, Drive, Docs, Sheets)\n"
+printf "    • Google Workspace — 167 tools\n"
 printf "    • Telegram         — 218 tools\n"
 printf "    • Fathom           — 10 tools\n"
-printf "    ${DIM}Total: 566 tools${RESET}\n"
 printf "\n"
 printf "  ${BOLD}Next steps:${RESET}\n"
 printf "\n"
-printf "    ${BOLD}1.${RESET} Open terminal and run:\n"
+printf "    ${BOLD}1.${RESET} Configure your API keys. Run:\n"
 printf "\n"
-printf "       ${BLUE}cd ~/.mcp-pack && claude${RESET}\n"
+printf "       ${BOLD}cd ~/.mcp-pack && claude${RESET}\n"
 printf "\n"
-printf "    ${BOLD}2.${RESET} Tell Claude your API keys:\n"
+printf "    ${BOLD}2.${RESET} Tell Claude your keys:\n"
 printf "\n"
-printf "       ${DIM}\"Here are my keys:${RESET}\n"
-printf "       ${DIM} Trello API key: xxx, token: yyy${RESET}\n"
-printf "       ${DIM} Fathom API key: zzz, webhook secret: www${RESET}\n"
-printf "       ${DIM} Telegram bot token: ttt${RESET}\n"
-printf "       ${DIM} Please configure them in Claude Desktop.\"${RESET}\n"
+printf "       ${DIM}\"Here are my API keys:${RESET}\n"
+printf "       ${DIM} Trello: key=xxx, token=yyy${RESET}\n"
+printf "       ${DIM} Fathom: key=zzz, secret=www${RESET}\n"
+printf "       ${DIM} Telegram: token=ttt${RESET}\n"
+printf "       ${DIM} Configure them in Claude Desktop.\"${RESET}\n"
 printf "\n"
-printf "    ${BOLD}3.${RESET} Restart Claude Desktop\n"
+printf "    ${BOLD}3.${RESET} Restart Claude Desktop — done!\n"
 printf "\n"
-printf "    ${BOLD}4.${RESET} Done! Start chatting with your 566 tools.\n"
-printf "\n"
-printf "  ${DIM}Google Workspace requires additional OAuth setup:${RESET}\n"
-printf "  ${DIM}cd ~/.mcp-pack/connectors/MCP_Google_Workspace && python3 setup_auth.py${RESET}\n"
-printf "\n"
-printf "  ${DIM}Installed to: $INSTALL_DIR${RESET}\n"
+printf "  ${DIM}Google Workspace: cd ~/.mcp-pack/connectors/MCP_Google_Workspace && python3 setup_auth.py${RESET}\n"
 printf "  ${DIM}by m0rvayne · github.com/m0rvayne/mcp-pack${RESET}\n"
 printf "\n"
 
