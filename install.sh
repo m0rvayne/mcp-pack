@@ -459,8 +459,24 @@ if os.path.exists(config_path) and os.path.getsize(config_path) > 0:
 if not isinstance(existing, dict):
     existing = {}
 
+# Skip servers where ALL env values are CONFIGURE_ME (they crash on startup)
+# These get added later when user provides real keys via Claude CLI
+filtered_fragment = dict(fragment)
+if 'mcpServers' in filtered_fragment:
+    safe_servers = {}
+    skipped = []
+    for name, conf in filtered_fragment['mcpServers'].items():
+        env = conf.get('env', {})
+        if env and all(v == 'CONFIGURE_ME' for v in env.values()):
+            skipped.append(name)
+        else:
+            safe_servers[name] = conf
+    filtered_fragment['mcpServers'] = safe_servers
+    if skipped:
+        print(f"  Deferred (need API keys first): {', '.join(skipped)}", file=sys.stderr)
+
 # Deep merge — existing values win over CONFIGURE_ME placeholders
-merged = deep_merge(existing, fragment)
+merged = deep_merge(existing, filtered_fragment)
 
 # Backup with pruning
 if os.path.exists(config_path):
@@ -516,11 +532,51 @@ When the user provides API keys, update Claude Desktop config.
 `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ## What to do
-1. Read the config file
-2. Find the connector in `mcpServers`
-3. Replace `CONFIGURE_ME` values with actual keys
+1. Read the config file at the path above
+2. If the connector already exists in `mcpServers` — replace `CONFIGURE_ME` values with actual keys
+3. If the connector does NOT exist yet (deferred during install) — ADD the full server entry with the real keys
 4. Write back the file (use json.dump with indent=2)
 5. Tell user to restart Claude Desktop
+
+## Server configs to add (when user provides keys)
+
+When adding a deferred server, use these templates with the user's REAL keys (not CONFIGURE_ME):
+
+### Trello
+```json
+"trello": {
+    "command": "~/.mcp-pack/connectors/MCP_Trello/.venv/bin/python3",
+    "args": ["~/.mcp-pack/connectors/MCP_Trello/server.py"],
+    "env": {
+        "TRELLO_API_KEY": "USER_KEY_HERE",
+        "TRELLO_API_TOKEN": "USER_TOKEN_HERE"
+    }
+}
+```
+
+### Fathom
+```json
+"fathom": {
+    "command": "~/.mcp-pack/connectors/MCP_Fathom/.venv/bin/python3",
+    "args": ["~/.mcp-pack/connectors/MCP_Fathom/server.py"],
+    "env": {
+        "FATHOM_API_KEY": "USER_KEY_HERE",
+        "FATHOM_WEBHOOK_SECRET": "USER_SECRET_HERE"
+    }
+}
+```
+
+### Telegram
+```json
+"telegram": {
+    "command": "~/.mcp-pack/connectors/MCP_Telegram/build/index.js",
+    "args": [],
+    "env": {
+        "TELEGRAM_BOT_TOKEN": "USER_TOKEN_HERE"
+    }
+}
+```
+IMPORTANT: Replace ~ with the user's actual home directory path (use $HOME or read it).
 
 ## Keys needed
 
