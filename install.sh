@@ -91,6 +91,9 @@ install_node() {
     info "Installed to $NODE_DIR"
 }
 
+NODE_BIN=""
+NPM_BIN=""
+
 if command -v node >/dev/null 2>&1; then
     NODE_MAJOR=$(node --version | sed 's/v\([0-9]*\).*/\1/')
     if [ "$NODE_MAJOR" -ge 18 ]; then
@@ -121,13 +124,24 @@ else
     info "uv already installed"
 fi
 
-# Ensure Python 3.12
 if ! uv python find 3.12 >/dev/null 2>&1; then
     say "Installing Python 3.12 via uv..."
     uv python install 3.12 2>/dev/null
     info "Python 3.12 installed"
 else
     info "Python 3.12 already available"
+fi
+
+# ─── Install Claude CLI ──────────────────────────────────────────────────────
+
+say "Installing Claude CLI..."
+if command -v claude >/dev/null 2>&1; then
+    info "Claude CLI already installed ($(claude --version 2>/dev/null || echo 'unknown version'))"
+else
+    "$NPM_BIN" install -g @anthropic-ai/claude-code 2>/dev/null || \
+        npm install -g @anthropic-ai/claude-code 2>/dev/null || \
+        { warn "Could not install globally, using npx"; }
+    info "Claude CLI installed"
 fi
 
 # ─── Download connectors ─────────────────────────────────────────────────────
@@ -139,10 +153,10 @@ if command -v git >/dev/null 2>&1; then
         info "Updating existing installation..."
         git -C "$INSTALL_DIR" pull --ff-only 2>/dev/null || true
     else
+        rm -rf "$INSTALL_DIR"
         git clone --depth 1 "$REPO.git" "$INSTALL_DIR" 2>/dev/null
     fi
 else
-    # Fallback: download tarball
     info "git not found, downloading archive..."
     curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" \
         | tar xz -C "$(dirname "$INSTALL_DIR")"
@@ -161,7 +175,6 @@ info "Trello..."
 cd "$INSTALL_DIR/connectors/MCP_Trello"
 uv venv --python 3.12 .venv 2>/dev/null
 uv pip install -r requirements.txt --quiet 2>/dev/null
-TRELLO_PYTHON="$INSTALL_DIR/connectors/MCP_Trello/.venv/bin/python3"
 
 # Fathom (Python)
 info "Fathom..."
@@ -182,41 +195,7 @@ info "Telegram..."
 cd "$INSTALL_DIR/connectors/MCP_Telegram"
 "$NPM_BIN" install --silent 2>/dev/null || "$NPM_BIN" install 2>/dev/null
 
-# ─── Collect API keys ────────────────────────────────────────────────────────
-
-say "Configuring API keys..."
-printf "\n"
-printf "  ${DIM}Each connector needs API keys to work.${RESET}\n"
-printf "  ${DIM}Press Enter to skip — you can configure later.${RESET}\n"
-printf "\n"
-
-# Trello
-printf "  ${BOLD}Trello${RESET}\n"
-printf "    API Key (from https://trello.com/power-ups/admin): "
-read -r TRELLO_API_KEY
-printf "    API Token: "
-read -r TRELLO_API_TOKEN
-
-# Fathom
-printf "\n  ${BOLD}Fathom${RESET}\n"
-printf "    API Key (from https://fathom.video/settings/api): "
-read -r FATHOM_API_KEY
-printf "    Webhook Secret: "
-read -r FATHOM_WEBHOOK_SECRET
-
-# Google Workspace
-printf "\n  ${BOLD}Google Workspace${RESET}\n"
-printf "    ${DIM}Requires OAuth setup. Run after install:${RESET}\n"
-printf "    ${DIM}cd $INSTALL_DIR/connectors/MCP_Google_Workspace && python3 setup_auth.py${RESET}\n"
-
-# Telegram
-printf "\n  ${BOLD}Telegram${RESET}\n"
-printf "    Bot Token (from @BotFather): "
-read -r TELEGRAM_BOT_TOKEN
-
-printf "\n"
-
-# ─── Build Claude Desktop config ─────────────────────────────────────────────
+# ─── Configure Claude Desktop (with placeholders) ────────────────────────────
 
 say "Configuring Claude Desktop..."
 
@@ -226,24 +205,24 @@ if [ -f "$CLAUDE_CONFIG" ]; then
     info "Backed up existing config"
 fi
 
-# Build servers JSON
 UV_BIN="$HOME/.local/bin/uv"
+
 SERVERS_JSON=$(cat <<JSONEOF
 {
     "trello": {
         "command": "$INSTALL_DIR/connectors/MCP_Trello/.venv/bin/python3",
         "args": ["$INSTALL_DIR/connectors/MCP_Trello/server.py"],
         "env": {
-            "TRELLO_API_KEY": "${TRELLO_API_KEY:-CONFIGURE_ME}",
-            "TRELLO_API_TOKEN": "${TRELLO_API_TOKEN:-CONFIGURE_ME}"
+            "TRELLO_API_KEY": "CONFIGURE_ME",
+            "TRELLO_API_TOKEN": "CONFIGURE_ME"
         }
     },
     "fathom": {
         "command": "$UV_BIN",
         "args": ["--directory", "$INSTALL_DIR/connectors/MCP_Fathom", "run", "fastmcp", "run", "server.py"],
         "env": {
-            "FATHOM_API_KEY": "${FATHOM_API_KEY:-CONFIGURE_ME}",
-            "FATHOM_WEBHOOK_SECRET": "${FATHOM_WEBHOOK_SECRET:-CONFIGURE_ME}"
+            "FATHOM_API_KEY": "CONFIGURE_ME",
+            "FATHOM_WEBHOOK_SECRET": "CONFIGURE_ME"
         }
     },
     "google-workspace": {
@@ -254,7 +233,7 @@ SERVERS_JSON=$(cat <<JSONEOF
         "command": "$NODE_BIN",
         "args": ["$INSTALL_DIR/connectors/MCP_Telegram/build/index.js"],
         "env": {
-            "TELEGRAM_BOT_TOKEN": "${TELEGRAM_BOT_TOKEN:-CONFIGURE_ME}"
+            "TELEGRAM_BOT_TOKEN": "CONFIGURE_ME"
         }
     }
 }
@@ -266,7 +245,6 @@ if [ ! -s "$CLAUDE_CONFIG" ]; then
     echo '{"mcpServers":{}}' > "$CLAUDE_CONFIG"
 fi
 
-# Use python3 for JSON merge (always available on macOS)
 /usr/bin/python3 -c "
 import json, sys
 
@@ -294,34 +272,148 @@ with open(config_path, 'w') as f:
 print(f'  Added {added} connector(s) to Claude Desktop config')
 " "$CLAUDE_CONFIG" "$SERVERS_JSON"
 
+# ─── Create helper script for Claude CLI to configure keys ────────────────────
+
+HELPER_SCRIPT="$INSTALL_DIR/configure-keys.sh"
+cat > "$HELPER_SCRIPT" << 'HELPEREOF'
+#!/bin/bash
+# Helper: configure API keys in Claude Desktop config
+# Usage: called by Claude CLI when user provides keys
+
+CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <connector> <key>=<value> [<key>=<value> ...]"
+    echo "Connectors: trello, fathom, telegram"
+    exit 1
+fi
+
+CONNECTOR="$1"
+shift
+
+/usr/bin/python3 -c "
+import json, sys
+
+config_path = '$CONFIG'
+connector = sys.argv[1]
+pairs = sys.argv[2:]
+
+with open(config_path, 'r') as f:
+    config = json.load(f)
+
+server = config.get('mcpServers', {}).get(connector)
+if not server:
+    print(f'Connector \"{connector}\" not found in config')
+    sys.exit(1)
+
+env = server.setdefault('env', {})
+for pair in pairs:
+    key, _, value = pair.partition('=')
+    env[key] = value
+    print(f'  Set {key} for {connector}')
+
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=2)
+
+print(f'Keys configured for {connector}. Restart Claude Desktop.')
+" "$CONNECTOR" "$@"
+HELPEREOF
+chmod +x "$HELPER_SCRIPT"
+
+# ─── Create CLAUDE.md for Claude CLI context ──────────────────────────────────
+
+cat > "$INSTALL_DIR/CLAUDE.md" << 'CLAUDEMD'
+# MCP Pack — Key Configuration
+
+When the user provides API keys for their MCP connectors, update the Claude Desktop config file.
+
+## Config file location
+`~/Library/Application Support/Claude/claude_desktop_config.json`
+
+## How to configure keys
+
+When the user says something like "here are my keys" or "configure Trello with key XXX":
+
+1. Read the config file
+2. Find the connector in `mcpServers`
+3. Replace `CONFIGURE_ME` values in the `env` section with the actual keys
+4. Write back the file
+5. Tell the user to restart Claude Desktop
+
+## Connectors and their keys
+
+### Trello
+- `TRELLO_API_KEY` — from https://trello.com/power-ups/admin
+- `TRELLO_API_TOKEN` — from Trello authorization
+
+### Fathom
+- `FATHOM_API_KEY` — from https://fathom.video/settings/api
+- `FATHOM_WEBHOOK_SECRET` — from Fathom webhook settings
+
+### Telegram
+- `TELEGRAM_BOT_TOKEN` — from @BotFather on Telegram
+
+### Google Workspace
+No API keys needed in config — requires OAuth setup:
+```
+cd ~/.mcp-pack/connectors/MCP_Google_Workspace && python3 setup_auth.py
+```
+
+## Example
+
+User: "My Trello API key is abc123 and token is xyz789"
+
+You should:
+1. Read ~/Library/Application Support/Claude/claude_desktop_config.json
+2. Set mcpServers.trello.env.TRELLO_API_KEY = "abc123"
+3. Set mcpServers.trello.env.TRELLO_API_TOKEN = "xyz789"
+4. Save the file
+5. Tell user: "Keys configured! Restart Claude Desktop."
+
+## Helper script
+
+You can also use the helper:
+```bash
+~/.mcp-pack/configure-keys.sh trello TRELLO_API_KEY=abc123 TRELLO_API_TOKEN=xyz789
+~/.mcp-pack/configure-keys.sh fathom FATHOM_API_KEY=xxx FATHOM_WEBHOOK_SECRET=yyy
+~/.mcp-pack/configure-keys.sh telegram TELEGRAM_BOT_TOKEN=zzz
+```
+CLAUDEMD
+
 # ─── Done ─────────────────────────────────────────────────────────────────────
 
 printf "\n"
-printf "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
+printf "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
 printf "${GREEN}${BOLD}  ✓ MCP Pack installed successfully!${RESET}\n"
-printf "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
+printf "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
 printf "\n"
-printf "  ${BOLD}Connectors installed:${RESET}\n"
-printf "    • Trello        — 171 tools\n"
+printf "  ${BOLD}Installed:${RESET}\n"
+printf "    • Trello           — 171 tools\n"
 printf "    • Google Workspace — 167 tools (Calendar, Drive, Docs, Sheets)\n"
-printf "    • Telegram      — 218 tools\n"
-printf "    • Fathom        — 10 tools\n"
+printf "    • Telegram         — 218 tools\n"
+printf "    • Fathom           — 10 tools\n"
 printf "    ${DIM}Total: 566 tools${RESET}\n"
 printf "\n"
 printf "  ${BOLD}Next steps:${RESET}\n"
-printf "    1. Restart Claude Desktop\n"
-printf "    2. Start chatting — your connectors are ready!\n"
 printf "\n"
-
-if [ "${TRELLO_API_KEY:-}" = "" ] || [ "${FATHOM_API_KEY:-}" = "" ] || [ "${TELEGRAM_BOT_TOKEN:-}" = "" ]; then
-    printf "  ${YELLOW}Some API keys were skipped.${RESET}\n"
-    printf "  Edit: ${DIM}~/Library/Application Support/Claude/claude_desktop_config.json${RESET}\n"
-    printf "  Replace ${DIM}CONFIGURE_ME${RESET} with your actual keys.\n"
-    printf "\n"
-fi
-
-printf "  ${DIM}Google Workspace requires OAuth setup:${RESET}\n"
-printf "  ${DIM}cd $INSTALL_DIR/connectors/MCP_Google_Workspace && python3 setup_auth.py${RESET}\n"
+printf "    ${BOLD}1.${RESET} Open terminal and run:\n"
+printf "\n"
+printf "       ${BLUE}cd ~/.mcp-pack && claude${RESET}\n"
+printf "\n"
+printf "    ${BOLD}2.${RESET} Tell Claude your API keys:\n"
+printf "\n"
+printf "       ${DIM}\"Here are my keys:${RESET}\n"
+printf "       ${DIM} Trello API key: xxx, token: yyy${RESET}\n"
+printf "       ${DIM} Fathom API key: zzz, webhook secret: www${RESET}\n"
+printf "       ${DIM} Telegram bot token: ttt${RESET}\n"
+printf "       ${DIM} Please configure them in Claude Desktop.\"${RESET}\n"
+printf "\n"
+printf "    ${BOLD}3.${RESET} Restart Claude Desktop\n"
+printf "\n"
+printf "    ${BOLD}4.${RESET} Done! Start chatting with your 566 tools.\n"
+printf "\n"
+printf "  ${DIM}Google Workspace requires additional OAuth setup:${RESET}\n"
+printf "  ${DIM}cd ~/.mcp-pack/connectors/MCP_Google_Workspace && python3 setup_auth.py${RESET}\n"
 printf "\n"
 printf "  ${DIM}Installed to: $INSTALL_DIR${RESET}\n"
 printf "  ${DIM}by m0rvayne · github.com/m0rvayne/mcp-pack${RESET}\n"
